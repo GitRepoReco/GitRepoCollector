@@ -1,0 +1,44 @@
+services:
+  postgres:
+    image: postgres:16
+    container_name: github_postgres
+    restart: unless-stopped
+
+    environment:
+      POSTGRES_DB: github_data
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+
+    ports:
+      - "5432:5432"
+
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  collector:
+    build: .
+    container_name: github_collector
+    restart: unless-stopped
+
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+    env_file:
+      - .env
+
+    environment:
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: 5432
+      MAX_REPOSITORIES: 0
+      POLL_INTERVAL_SECONDS: 300
+      LOG_LEVEL: INFO
+
+volumes:
+  postgres_data:
