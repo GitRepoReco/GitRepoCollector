@@ -10,8 +10,6 @@ from github.client import GitHubGraphQLClient
 from github.queries import (
     QUERY_REPOSITORY_README,
     QUERY_REPOSITORY_STATS,
-    QUERY_SEARCH_REPOSITORIES,
-    QUERY_SEARCH_COUNT,
 )
 from monitoring.rate_limit import RateLimitMonitor
 
@@ -38,140 +36,8 @@ def _build_tier_ranges(tiers: list[int]) -> list[tuple[int, int | None]]:
 
 def _search_query_for_tier(low: int, high: int | None) -> str:
     if high is None:
-        return f"stars:>={low} sort:created-asc"
-    return f"stars:{low}..{high} sort:created-asc"
-
-
-# ============================================================
-# Stratégie de pagination avec découpage par dates
-# (pour dépasser la limite GitHub de 1000 résultats)
-# ============================================================
-
-def _search_query_with_dates(low: int, high: int | None, from_date: str | None = None, to_date: str | None = None) -> str:
-    """
-    Construit une requête de recherche avec filtres de dates.
-    from_date/to_date au format YYYY-MM-DD
-    """
-    base = _search_query_for_tier(low, high)
-    # Remplacer " sort:" pour insérer le filtre created
-    if from_date or to_date:
-        created_filter = ""
-        if from_date and to_date:
-            created_filter = f" created:{from_date}..{to_date}"
-        elif from_date:
-            created_filter = f" created:>={from_date}"
-        elif to_date:
-            created_filter = f" created:<={to_date}"
-        base = base.replace(" sort:", created_filter + " sort:")
-    return base
-
-
-def _get_search_count(
-    client: GitHubGraphQLClient,
-    monitor: RateLimitMonitor,
-    conn: Any,
-    low: int,
-    high: int | None,
-    from_date: str | None = None,
-    to_date: str | None = None,
-) -> int:
-    """Retourne le nombre total de résultats pour une requête de recherche."""
-    search_query = _search_query_with_dates(low, high, from_date, to_date)
-    data, rate_limit = client.execute(
-        QUERY_SEARCH_COUNT,
-        {"query": search_query},
-        operation_name="SearchCount",
-    )
-    monitor.record(conn, rate_limit, "SearchCount")
-    monitor.check_and_wait(rate_limit)
-    return data.get("search", {}).get("repositoryCount", 0)
-
-
-def _paginate_with_date_splits(
-    client: GitHubGraphQLClient,
-    monitor: RateLimitMonitor,
-    conn: Any,
-    low: int,
-    high: int | None,
-    from_date: str | None = None,
-    to_date: str | None = None,
-    max_results: int = 1000,
-) -> list[dict]:
-    """
-    Pagine tous les repos d'une tranche, en splittant par dates si nécessaire.
-    Retourne la liste de tous les repos trouvés (en gérant le limite de 1000).
-    """
-    all_repos = []
-
-    # Vérifier le nombre total avant de paginer
-    total_count = _get_search_count(client, monitor, conn, low, high, from_date, to_date)
-    logger.debug("Requête %s — %d résultats total", _search_query_with_dates(low, high, from_date, to_date), total_count)
-
-    # Si <= 1000, paginer normalement sans split
-    if total_count <= max_results:
-        search_query = _search_query_with_dates(low, high, from_date, to_date)
-        for nodes, rate_limit in client.paginate(
-            QUERY_SEARCH_REPOSITORIES,
-            {"query": search_query},
-            page_info_path=["search", "pageInfo"],
-            nodes_path=["search", "nodes"],
-            operation_name="SearchRepositories",
-        ):
-            monitor.record(conn, rate_limit, "SearchRepositories")
-            monitor.check_and_wait(rate_limit)
-            repos = [_parse_repo(n) for n in nodes if n.get("id")]
-            all_repos.extend(repos)
-        return all_repos
-
-    # Si > 1000, découper par dates (binary split)
-    logger.info(
-        "  %d résultats détectés — découpage par dates nécessaire.",
-        total_count,
-    )
-
-    # Déterminer la plage de dates à splitter
-    if from_date and to_date:
-        from_dt = datetime.strptime(from_date, "%Y-%m-%d").replace(tzinfo=timezone.utc)
-        to_dt = datetime.strptime(to_date, "%Y-%m-%d").replace(tzinfo=timezone.utc)
-    elif from_date:
-        from_dt = datetime.strptime(from_date, "%Y-%m-%d").replace(tzinfo=timezone.utc)
-        to_dt = datetime.now(timezone.utc)
-    elif to_date:
-        from_dt = datetime(2008, 1, 1, tzinfo=timezone.utc)  # GitHub fondé en 2008
-        to_dt = datetime.strptime(to_date, "%Y-%m-%d").replace(tzinfo=timezone.utc)
-    else:
-        from_dt = datetime(2008, 1, 1, tzinfo=timezone.utc)
-        to_dt = datetime.now(timezone.utc)
-
-    # Découper au milieu
-    mid_dt = from_dt + (to_dt - from_dt) / 2
-    mid_date = mid_dt.strftime("%Y-%m-%d")
-
-    # Récursivement paginer chaque moitié
-    logger.info("  Découpage : %s..%s → %s..%s et %s..%s",
-        (from_date or "2008-01-01"),
-        (to_date or datetime.now(timezone.utc).strftime("%Y-%m-%d")),
-        (from_date or "2008-01-01"),
-        mid_date,
-        mid_date,
-        (to_date or datetime.now(timezone.utc).strftime("%Y-%m-%d")),
-    )
-
-    left_repos = _paginate_with_date_splits(
-        client, monitor, conn, low, high,
-        from_date or "2008-01-01",
-        mid_date,
-    )
-    all_repos.extend(left_repos)
-
-    right_repos = _paginate_with_date_splits(
-        client, monitor, conn, low, high,
-        mid_date,
-        to_date or datetime.now(timezone.utc).strftime("%Y-%m-%d"),
-    )
-    all_repos.extend(right_repos)
-
-    return all_repos
+        return f"stars:>={low}"
+    return f"stars:{low}..{high}"
 
 def _parse_repo(node: dict) -> dict:
     lang = node.get("primaryLanguage") or {}
@@ -536,34 +402,35 @@ class HistoricalCollector:
     def _collect_tier_metadata(
         self, low: int, high: int | None, already_collected: int
     ) -> list[dict]:
-        """
-        Collecte les métadonnées d'une tranche, avec découpage automatique par dates
-        quand le nombre de résultats dépasse 1000.
-        """
-        logger.info("  Collecte des métadonnées avec découpage par dates si nécessaire...")
+        """Collecte les métadonnées d'une tranche en utilisant la pagination cursor GitHub."""
+        logger.info("  Collecte des métadonnées via pagination cursor GitHub...")
 
         conn = get_connection()
         try:
-            # Récupérer tous les repos avec gestion du découpage par dates
-            all_repos = _paginate_with_date_splits(
-                self._client,
-                self._monitor,
-                conn,
-                low,
-                high,
-            )
+            search_query = _search_query_for_tier(low, high)
+            collected: list[dict] = []
 
-            # Limiter par MAX_REPOSITORIES si défini
-            collected = []
-            for repo in all_repos:
+            for nodes, rate_limit in self._client.paginate_searches(
+                search_query,
+                ["created-asc", "updated-desc"],
+                operation_name="SearchRepositories",
+            ):
+                self._monitor.record(conn, rate_limit, "SearchRepositories")
+                self._monitor.check_and_wait(rate_limit)
+
+                for node in nodes:
+                    if MAX_REPOSITORIES and already_collected + len(collected) >= MAX_REPOSITORIES:
+                        break
+                    repo = _parse_repo(node)
+                    if repo.get("id"):
+                        collected.append(repo)
+
                 if MAX_REPOSITORIES and already_collected + len(collected) >= MAX_REPOSITORIES:
                     break
-                collected.append(repo)
 
-            # Insérer tous les repos en base
             _upsert_repositories(conn, collected)
 
-            logger.info("  Métadonnées collectées : %d repositories (total pour cette tranche).", len(collected))
+            logger.info("  Métadonnées collectées : %d repositories (cette tranche).", len(collected))
 
         finally:
             conn.close()

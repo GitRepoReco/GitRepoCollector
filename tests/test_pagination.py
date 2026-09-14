@@ -88,3 +88,27 @@ class TestPaginate:
 
         assert calls[0]["after"] is None
         assert calls[1]["after"] == "abc123"
+
+    def test_paginate_searches_runs_created_then_updated_order(self):
+        created_page = _page([{"id": "C_1"}], has_next=False, cursor=None)
+        updated_page = _page([{"id": "U_1"}], has_next=False, cursor=None)
+
+        calls = []
+
+        def capture_call(*args, **kwargs):
+            calls.append(kwargs.get("json", {}).get("variables", {}))
+            if len(calls) == 1:
+                return _mock_response(created_page)
+            return _mock_response(updated_page)
+
+        with patch("requests.post", side_effect=capture_call):
+            results = []
+            for nodes, _ in self.client.paginate_searches(
+                "is:public",
+                ["created-asc", "updated-desc"],
+            ):
+                results.extend(nodes)
+
+        assert results == [{"id": "C_1"}, {"id": "U_1"}]
+        assert calls[0]["query"].endswith("sort:created-asc")
+        assert calls[1]["query"].endswith("sort:updated-desc")

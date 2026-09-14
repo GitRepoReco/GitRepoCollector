@@ -1,4 +1,5 @@
 import logging
+import re
 import time
 from datetime import datetime, timezone
 from typing import Generator
@@ -7,6 +8,7 @@ import requests
 import requests.models
 
 from config import GITHUB_GRAPHQL_URL, GITHUB_TOKEN, PAGE_SIZE
+from github.queries import QUERY_SEARCH_REPOSITORIES
 
 logger = logging.getLogger(__name__)
 
@@ -188,6 +190,10 @@ class GitHubGraphQLClient:
         page_info_path : chemin dans data["x"]["y"]["pageInfo"]
         nodes_path     : chemin dans data["x"]["y"]["nodes"]
         Yield : (nodes, rate_limit_info) pour chaque page.
+
+        Remarque importante : le cursor renvoyé par GitHub n'est valide que pour
+        la requête exacte et le tri exact utilisé pour cette page. Il ne faut pas
+        mélanger des cursors de deux ordres de tri différents.
         """
         cursor = None
 
@@ -211,6 +217,54 @@ class GitHubGraphQLClient:
             if not page_info_container.get("hasNextPage"):
                 break
             cursor = page_info_container["endCursor"]
+
+    @staticmethod
+    def _with_sort(search_query: str, sort_value: str) -> str:
+        """Injecte ou remplace le suffixe `sort:...` de la requête de recherche."""
+        query = search_query.strip()
+        if not query:
+            return f"sort:{sort_value}"
+        if re.search(r"\bsort:[^\s]+", query):
+            return re.sub(r"\s*sort:[^\s]+", f" sort:{sort_value}", query)
+        return f"{query} sort:{sort_value}"
+
+    def paginate_searches(
+        self,
+        search_query: str,
+        sort_orders: list[str] | tuple[str, ...],
+        variables: dict[str, object] | None = None,
+        query_template: str | None = None,
+        page_info_path: list[str] | None = None,
+        nodes_path: list[str] | None = None,
+        operation_name: str = "SearchRepositories",
+    ) -> Generator[tuple[list, dict], None, None]:
+        """
+        Parcourt toutes les pages pour un ensemble d'ordres de tri successifs.
+
+        Les ordres sont traités séquentiellement ; un cursor est toujours utilisé
+        avec le même tri qui l'a généré. C'est la bonne manière d'itérer tout le
+        corpus selon GitHub : on finit complètement un ordre, puis on passe au
+        suivant (ex. `created-asc` puis `updated-desc`).
+        """
+        if not sort_orders:
+            return
+
+        if query_template is None:
+            query_template = QUERY_SEARCH_REPOSITORIES
+        if page_info_path is None:
+            page_info_path = ["search", "pageInfo"]
+        if nodes_path is None:
+            nodes_path = ["search", "nodes"]
+
+        for sort_order in sort_orders:
+            ordered_query = self._with_sort(search_query, sort_order)
+            yield from self.paginate(
+                query_template,
+                {**(variables or {}), "query": ordered_query},
+                page_info_path,
+                nodes_path,
+                operation_name=f"{operation_name}_{sort_order}",
+            )
 
     # ----------------------------------------------------------
     # REST API : récupère le README brut
