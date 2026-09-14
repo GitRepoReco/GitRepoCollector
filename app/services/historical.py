@@ -39,6 +39,67 @@ def _search_query_for_tier(low: int, high: int | None) -> str:
         return f"stars:>={low}"
     return f"stars:{low}..{high}"
 
+
+def _load_progress_for_tier(
+    conn: DBConn,
+    phase: str,
+    low: int,
+    high: int | None,
+) -> dict[str, dict[str, Any]]:
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            """
+            SELECT sort_order, cursor, completed
+            FROM github.collection_progress
+            WHERE phase = %s
+              AND tier_low = %s
+              AND tier_high IS NOT DISTINCT FROM %s
+            """,
+            (phase, low, high),
+        )
+        rows = cur.fetchall()
+        return {
+            row[0]: {
+                "cursor": row[1],
+                "completed": row[2],
+            }
+            for row in rows
+        }
+    finally:
+        cur.close()
+
+
+def _upsert_progress(
+    conn: DBConn,
+    phase: str,
+    low: int,
+    high: int | None,
+    sort_order: str,
+    search_query: str,
+    cursor: str | None,
+    completed: bool,
+) -> None:
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            """
+            INSERT INTO github.collection_progress (
+                phase, tier_low, tier_high, sort_order, search_query,
+                cursor, completed, updated_at
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, CURRENT_TIMESTAMP)
+            ON CONFLICT (phase, tier_low, tier_high, sort_order)
+            DO UPDATE SET
+                search_query = EXCLUDED.search_query,
+                cursor = EXCLUDED.cursor,
+                completed = EXCLUDED.completed,
+                updated_at = CURRENT_TIMESTAMP
+            """,
+            (phase, low, high, sort_order, search_query, cursor, completed),
+        )
+    finally:
+        cur.close()
+
 def _parse_repo(node: dict) -> dict:
     lang = node.get("primaryLanguage") or {}
     branch_ref = node.get("defaultBranchRef") or {}
@@ -408,11 +469,28 @@ class HistoricalCollector:
         conn = get_connection()
         try:
             search_query = _search_query_for_tier(low, high)
+            phase = "historical_metadata"
+            sort_orders = ["created-asc", "updated-desc"]
+            progress = _load_progress_for_tier(conn, phase, low, high)
+
+            start_cursors = {
+                sort_order: progress.get(sort_order, {}).get("cursor")
+                for sort_order in sort_orders
+                if not progress.get(sort_order, {}).get("completed", False)
+            }
+
+            # Si les deux tris sont déjà terminés, on évite de relancer la tranche.
+            if all(progress.get(sort_order, {}).get("completed", False) for sort_order in sort_orders):
+                logger.info("  Tranche %s déjà complétée (checkpoint).", search_query)
+                return []
+
             collected: list[dict] = []
 
-            for nodes, rate_limit in self._client.paginate_searches(
+            for sort_order, nodes, rate_limit, page_info in self._client.paginate_searches(
                 search_query,
-                ["created-asc", "updated-desc"],
+                sort_orders,
+                start_cursors=start_cursors,
+                include_page_info=True,
                 operation_name="SearchRepositories",
             ):
                 self._monitor.record(conn, rate_limit, "SearchRepositories")
@@ -424,6 +502,22 @@ class HistoricalCollector:
                     repo = _parse_repo(node)
                     if repo.get("id"):
                         collected.append(repo)
+
+                has_next_page = page_info.get("hasNextPage", False)
+                next_cursor = page_info.get("endCursor") if has_next_page else None
+
+                # Le checkpoint est enregistré après traitement de la page pour garantir une reprise sûre.
+                _upsert_progress(
+                    conn,
+                    phase,
+                    low,
+                    high,
+                    sort_order,
+                    search_query,
+                    next_cursor,
+                    completed=not has_next_page,
+                )
+                conn.commit()
 
                 if MAX_REPOSITORIES and already_collected + len(collected) >= MAX_REPOSITORIES:
                     break
@@ -462,6 +556,10 @@ class HistoricalCollector:
             conn_check.close()
 
         logger.info("  %d repositories à traiter (après filtrage).", len(repos_to_collect))
+
+        if not repos_to_collect:
+            logger.info("  Aucun repository à traiter pour cette passe README.")
+            return
 
         # Paralléliser : max 5 workers pour ne pas surcharger l'API
         max_workers = min(5, len(repos_to_collect))

@@ -141,6 +141,30 @@ def initialize_schemas() -> None:
         """)
         cur.execute("CREATE INDEX IF NOT EXISTS idx_rate_limit_timestamp ON monitoring.rate_limit_usage(timestamp);")
 
+        # --------------------------------------------------------
+        # github.collection_progress — reprise pagination historique
+        # --------------------------------------------------------
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS github.collection_progress (
+                id               BIGSERIAL PRIMARY KEY,
+                phase            VARCHAR(100) NOT NULL,
+                tier_low         INTEGER NOT NULL,
+                tier_high        INTEGER,
+                sort_order       VARCHAR(50) NOT NULL,
+                search_query     TEXT NOT NULL,
+                cursor           TEXT,
+                completed        BOOLEAN NOT NULL DEFAULT FALSE,
+                updated_at       TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE (phase, tier_low, tier_high, sort_order)
+            );
+        """)
+        cur.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_collection_progress_lookup
+                ON github.collection_progress(phase, tier_low, tier_high, completed);
+            """
+        )
+
         conn.commit()
         logger.info("Schemas et tables initialisés.")
 

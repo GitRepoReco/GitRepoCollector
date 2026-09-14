@@ -182,8 +182,10 @@ class GitHubGraphQLClient:
         variables: dict[str, object],
         page_info_path: list[str],
         nodes_path: list[str],
+        start_cursor: str | None = None,
+        include_page_info: bool = False,
         operation_name: str = "paginate",
-    ) -> Generator[tuple[list, dict], None, None]:
+    ) -> Generator[tuple[list, dict] | tuple[list, dict, dict], None, None]:
         """
         Itère sur toutes les pages GraphQL.
 
@@ -195,7 +197,7 @@ class GitHubGraphQLClient:
         la requête exacte et le tri exact utilisé pour cette page. Il ne faut pas
         mélanger des cursors de deux ordres de tri différents.
         """
-        cursor = None
+        cursor = start_cursor
 
         while True:
             vars_with_cursor = {**variables, "after": cursor, "first": PAGE_SIZE}
@@ -212,7 +214,10 @@ class GitHubGraphQLClient:
 
             nodes = nodes_container if isinstance(nodes_container, list) else []
 
-            yield nodes, rate_limit
+            if include_page_info:
+                yield nodes, rate_limit, page_info_container
+            else:
+                yield nodes, rate_limit
 
             if not page_info_container.get("hasNextPage"):
                 break
@@ -236,8 +241,10 @@ class GitHubGraphQLClient:
         query_template: str | None = None,
         page_info_path: list[str] | None = None,
         nodes_path: list[str] | None = None,
+        start_cursors: dict[str, str | None] | None = None,
+        include_page_info: bool = False,
         operation_name: str = "SearchRepositories",
-    ) -> Generator[tuple[list, dict], None, None]:
+    ) -> Generator[tuple[str, list, dict] | tuple[str, list, dict, dict], None, None]:
         """
         Parcourt toutes les pages pour un ensemble d'ordres de tri successifs.
 
@@ -258,13 +265,22 @@ class GitHubGraphQLClient:
 
         for sort_order in sort_orders:
             ordered_query = self._with_sort(search_query, sort_order)
-            yield from self.paginate(
+            start_cursor = (start_cursors or {}).get(sort_order)
+            for page in self.paginate(
                 query_template,
                 {**(variables or {}), "query": ordered_query},
                 page_info_path,
                 nodes_path,
+                start_cursor=start_cursor,
+                include_page_info=include_page_info,
                 operation_name=f"{operation_name}_{sort_order}",
-            )
+            ):
+                if include_page_info:
+                    nodes, rate_limit, page_info = page
+                    yield sort_order, nodes, rate_limit, page_info
+                else:
+                    nodes, rate_limit = page
+                    yield sort_order, nodes, rate_limit
 
     # ----------------------------------------------------------
     # REST API : récupère le README brut

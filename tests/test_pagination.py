@@ -103,7 +103,7 @@ class TestPaginate:
 
         with patch("requests.post", side_effect=capture_call):
             results = []
-            for nodes, _ in self.client.paginate_searches(
+            for _, nodes, _ in self.client.paginate_searches(
                 "is:public",
                 ["created-asc", "updated-desc"],
             ):

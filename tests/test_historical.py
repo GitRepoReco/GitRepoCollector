@@ -40,10 +40,10 @@ class TestStarRanges:
         assert len(ranges) == len(tiers)
 
     def test_query_avec_borne_haute(self):
-        assert _search_query_for_tier(1000, 1999) == "stars:1000..1999 sort:created-asc"
+        assert _search_query_for_tier(1000, 1999) == "stars:1000..1999"
 
     def test_query_sans_borne_haute(self):
-        assert _search_query_for_tier(100000, None) == "stars:>=100000 sort:created-asc"
+        assert _search_query_for_tier(100000, None) == "stars:>=100000"
 
     def test_tiers_default_commencent_au_plus_eleve(self):
         from config import STAR_TIERS
