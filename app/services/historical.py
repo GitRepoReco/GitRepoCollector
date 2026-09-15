@@ -1,13 +1,15 @@
 import json
 import logging
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime, timedelta, timezone
-from typing import Any
+from datetime import date, datetime, timedelta, timezone
+from typing import Any, cast
 
 from config import MAX_REPOSITORIES, STAR_TIERS
 from database.connection import get_connection
 from github.client import GitHubGraphQLClient
 from github.queries import (
+    QUERY_SEARCH_COUNT,
     QUERY_REPOSITORY_README,
     QUERY_REPOSITORY_STATS,
 )
@@ -16,6 +18,10 @@ from monitoring.rate_limit import RateLimitMonitor
 logger = logging.getLogger(__name__)
 
 DBConn = Any
+
+SEARCH_RESULT_CAP = 1000
+DATE_LOW_DEFAULT = "2008-01-01"
+DATE_HIGH_DEFAULT = "2030-01-01"
 
 
 # ============================================================
@@ -34,17 +40,77 @@ def _build_tier_ranges(tiers: list[int]) -> list[tuple[int, int | None]]:
     return ranges
 
 
+def _make_segment(low: int, high: int | None, date_low: str = DATE_LOW_DEFAULT, date_high: str = DATE_HIGH_DEFAULT) -> dict[str, Any]:
+    return {
+        "low": low,
+        "high": high,
+        "date_low": date_low,
+        "date_high": date_high,
+    }
+
+
+def _segment_key(segment: dict[str, Any]) -> str:
+    high = segment["high"] if segment["high"] is not None else "inf"
+    return (
+        f"stars_{segment['low']}_{high}"
+        f"__pushed_{segment['date_low']}_{segment['date_high']}"
+    )
+
+
+def _split_segment(segment: dict[str, Any]) -> list[dict[str, Any]]:
+    """
+    Scinde un segment saturé (>1000 résultats GitHub Search).
+    Priorité : split stars, puis split date si stars indivisibles.
+    """
+    low = int(segment["low"])
+    high = segment["high"]
+
+    if isinstance(high, int) and low < high:
+        mid = low + (high - low) // 2
+        return [
+            _make_segment(low, mid, segment["date_low"], segment["date_high"]),
+            _make_segment(mid + 1, high, segment["date_low"], segment["date_high"]),
+        ]
+
+    date_low = date.fromisoformat(segment["date_low"])
+    date_high = date.fromisoformat(segment["date_high"])
+    span_days = (date_high - date_low).days
+    if span_days < 1:
+        return []
+
+    mid_offset = span_days // 2
+    mid_date = date_low + timedelta(days=mid_offset)
+    next_date = mid_date + timedelta(days=1)
+
+    return [
+        _make_segment(low, high, date_low.isoformat(), mid_date.isoformat()),
+        _make_segment(low, high, next_date.isoformat(), date_high.isoformat()),
+    ]
+
+
 def _search_query_for_tier(low: int, high: int | None) -> str:
     if high is None:
         return f"stars:>={low}"
     return f"stars:{low}..{high}"
 
 
-def _load_progress_for_tier(
+def _search_query_for_segment(segment: dict[str, Any]) -> str:
+    low = int(segment["low"])
+    high = segment["high"]
+
+    if high is None:
+        stars_part = f"stars:>={low}"
+    else:
+        stars_part = f"stars:{low}..{high}"
+
+    pushed_part = f"pushed:{segment['date_low']}..{segment['date_high']}"
+    return f"{stars_part} {pushed_part}"
+
+
+def _load_progress_for_segment(
     conn: DBConn,
     phase: str,
-    low: int,
-    high: int | None,
+    segment_key: str,
 ) -> dict[str, dict[str, Any]]:
     cur = conn.cursor()
     try:
@@ -53,10 +119,9 @@ def _load_progress_for_tier(
             SELECT sort_order, cursor, completed
             FROM github.collection_progress
             WHERE phase = %s
-              AND tier_low = %s
-              AND tier_high IS NOT DISTINCT FROM %s
+                            AND segment_key = %s
             """,
-            (phase, low, high),
+                        (phase, segment_key),
         )
         rows = cur.fetchall()
         return {
@@ -73,8 +138,11 @@ def _load_progress_for_tier(
 def _upsert_progress(
     conn: DBConn,
     phase: str,
+    segment_key: str,
     low: int,
     high: int | None,
+    date_low: str,
+    date_high: str,
     sort_order: str,
     search_query: str,
     cursor: str | None,
@@ -85,17 +153,33 @@ def _upsert_progress(
         cur.execute(
             """
             INSERT INTO github.collection_progress (
-                phase, tier_low, tier_high, sort_order, search_query,
+                phase, segment_key, tier_low, tier_high, date_low, date_high,
+                sort_order, search_query,
                 cursor, completed, updated_at
-            ) VALUES (%s, %s, %s, %s, %s, %s, %s, CURRENT_TIMESTAMP)
-            ON CONFLICT (phase, tier_low, tier_high, sort_order)
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, CURRENT_TIMESTAMP)
+            ON CONFLICT (phase, segment_key, sort_order)
             DO UPDATE SET
+                tier_low = EXCLUDED.tier_low,
+                tier_high = EXCLUDED.tier_high,
+                date_low = EXCLUDED.date_low,
+                date_high = EXCLUDED.date_high,
                 search_query = EXCLUDED.search_query,
                 cursor = EXCLUDED.cursor,
                 completed = EXCLUDED.completed,
                 updated_at = CURRENT_TIMESTAMP
             """,
-            (phase, low, high, sort_order, search_query, cursor, completed),
+            (
+                phase,
+                segment_key,
+                low,
+                high,
+                date_low,
+                date_high,
+                sort_order,
+                search_query,
+                cursor,
+                completed,
+            ),
         )
     finally:
         cur.close()
@@ -463,73 +547,122 @@ class HistoricalCollector:
     def _collect_tier_metadata(
         self, low: int, high: int | None, already_collected: int
     ) -> list[dict]:
-        """Collecte les métadonnées d'une tranche en utilisant la pagination cursor GitHub."""
-        logger.info("  Collecte des métadonnées via pagination cursor GitHub...")
+        """Collecte les métadonnées d'une tranche en scindant dynamiquement les segments saturés."""
+        logger.info("  Collecte des métadonnées via pagination cursor GitHub + split anti-1000...")
 
         conn = get_connection()
         try:
-            search_query = _search_query_for_tier(low, high)
             phase = "historical_metadata"
             sort_orders = ["created-asc", "updated-desc"]
-            progress = _load_progress_for_tier(conn, phase, low, high)
-
-            start_cursors = {
-                sort_order: progress.get(sort_order, {}).get("cursor")
-                for sort_order in sort_orders
-                if not progress.get(sort_order, {}).get("completed", False)
-            }
-
-            # Si les deux tris sont déjà terminés, on évite de relancer la tranche.
-            if all(progress.get(sort_order, {}).get("completed", False) for sort_order in sort_orders):
-                logger.info("  Tranche %s déjà complétée (checkpoint).", search_query)
-                return []
-
             collected: list[dict] = []
+            collected_by_id: dict[str, dict] = {}
+            queue: deque[dict[str, Any]] = deque([_make_segment(low, high)])
 
-            for sort_order, nodes, rate_limit, page_info in self._client.paginate_searches(
-                search_query,
-                sort_orders,
-                start_cursors=start_cursors,
-                include_page_info=True,
-                operation_name="SearchRepositories",
-            ):
-                self._monitor.record(conn, rate_limit, "SearchRepositories")
-                self._monitor.check_and_wait(rate_limit)
+            while queue:
+                segment = queue.popleft()
+                segment_key = _segment_key(segment)
+                search_query = _search_query_for_segment(segment)
 
-                for node in nodes:
-                    if MAX_REPOSITORIES and already_collected + len(collected) >= MAX_REPOSITORIES:
-                        break
-                    repo = _parse_repo(node)
-                    if repo.get("id"):
-                        collected.append(repo)
-
-                has_next_page = page_info.get("hasNextPage", False)
-                next_cursor = page_info.get("endCursor") if has_next_page else None
-
-                # Le checkpoint est enregistré après traitement de la page pour garantir une reprise sûre.
-                _upsert_progress(
-                    conn,
-                    phase,
-                    low,
-                    high,
-                    sort_order,
-                    search_query,
-                    next_cursor,
-                    completed=not has_next_page,
+                count_data, count_rate_limit = self._client.execute(
+                    QUERY_SEARCH_COUNT,
+                    {"query": search_query},
+                    "SearchCount",
                 )
-                conn.commit()
+                self._monitor.record(conn, count_rate_limit, "SearchCount")
+                self._monitor.check_and_wait(count_rate_limit)
 
-                if MAX_REPOSITORIES and already_collected + len(collected) >= MAX_REPOSITORIES:
+                repo_count = (count_data.get("search") or {}).get("repositoryCount", 0)
+
+                if repo_count > SEARCH_RESULT_CAP:
+                    children = _split_segment(segment)
+                    if children:
+                        logger.info(
+                            "  Segment saturé %s (%s > %s) — scission en %d sous-segments.",
+                            segment_key,
+                            repo_count,
+                            SEARCH_RESULT_CAP,
+                            len(children),
+                        )
+                        queue.extend(children)
+                        continue
+
+                    logger.warning(
+                        "  Segment saturé mais indivisible %s (%s résultats). Collecte partielle inévitable.",
+                        segment_key,
+                        repo_count,
+                    )
+
+                progress = _load_progress_for_segment(conn, phase, segment_key)
+                start_cursors = {
+                    sort_order: progress.get(sort_order, {}).get("cursor")
+                    for sort_order in sort_orders
+                    if not progress.get(sort_order, {}).get("completed", False)
+                }
+
+                if all(progress.get(sort_order, {}).get("completed", False) for sort_order in sort_orders):
+                    logger.info("  Segment %s déjà complété (checkpoint).", segment_key)
+                    continue
+
+                for page in self._client.paginate_searches(
+                    search_query,
+                    sort_orders,
+                    start_cursors=start_cursors,
+                    include_page_info=True,
+                    operation_name="SearchRepositories",
+                ):
+                    sort_order, nodes, rate_limit, page_info = cast(
+                        tuple[str, list, dict, dict],
+                        page,
+                    )
+                    self._monitor.record(conn, rate_limit, "SearchRepositories")
+                    self._monitor.check_and_wait(rate_limit)
+
+                    for node in nodes:
+                        if MAX_REPOSITORIES and already_collected + len(collected_by_id) >= MAX_REPOSITORIES:
+                            break
+                        repo = _parse_repo(node)
+                        repo_id = repo.get("id")
+                        if repo_id and repo_id not in collected_by_id:
+                            collected_by_id[repo_id] = repo
+                            collected.append(repo)
+
+                    has_next_page = page_info.get("hasNextPage", False)
+                    next_cursor = page_info.get("endCursor") if has_next_page else None
+
+                    _upsert_progress(
+                        conn,
+                        phase,
+                        segment_key,
+                        segment["low"],
+                        segment["high"],
+                        segment["date_low"],
+                        segment["date_high"],
+                        sort_order,
+                        search_query,
+                        next_cursor,
+                        completed=not has_next_page,
+                    )
+                    conn.commit()
+
+                    if MAX_REPOSITORIES and already_collected + len(collected_by_id) >= MAX_REPOSITORIES:
+                        break
+
+                if MAX_REPOSITORIES and already_collected + len(collected_by_id) >= MAX_REPOSITORIES:
                     break
 
-            _upsert_repositories(conn, collected)
+            unique_repos = list(collected_by_id.values())
+            _upsert_repositories(conn, unique_repos)
 
-            logger.info("  Métadonnées collectées : %d repositories (cette tranche).", len(collected))
+            logger.info(
+                "  Métadonnées collectées : %d uniques (%d entrées brutes, cette tranche).",
+                len(unique_repos),
+                len(collected),
+            )
 
         finally:
             conn.close()
 
-        return collected
+        return unique_repos
 
     # ----------------------------------------------------------
     # Phase 2 : README + stats pour tous les repos de la tranche
@@ -541,13 +674,15 @@ class HistoricalCollector:
         Utilise ThreadPoolExecutor pour paralléliser les requêtes REST (README)
         et GraphQL (stats) pour chaque repo.
         """
-        logger.info("  Passe README : %d repositories à traiter.", len(repos))
+        # Les repos peuvent se recouper entre tris; on déduplique avant la passe README.
+        repos_unique = list({repo["id"]: repo for repo in repos if repo.get("id")}.values())
+        logger.info("  Passe README : %d repositories à traiter.", len(repos_unique))
 
         # Filtrer les repos déjà collectés
         conn_check = get_connection()
         try:
             repos_to_collect = []
-            for repo in repos:
+            for repo in repos_unique:
                 if _readme_already_collected(conn_check, repo["id"]):
                     logger.debug("  [%s] README déjà collecté, skip.", repo["full_name"])
                 else:

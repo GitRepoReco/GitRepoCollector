@@ -148,8 +148,11 @@ def initialize_schemas() -> None:
             CREATE TABLE IF NOT EXISTS github.collection_progress (
                 id               BIGSERIAL PRIMARY KEY,
                 phase            VARCHAR(100) NOT NULL,
+                segment_key      TEXT,
                 tier_low         INTEGER NOT NULL,
                 tier_high        INTEGER,
+                date_low         DATE,
+                date_high        DATE,
                 sort_order       VARCHAR(50) NOT NULL,
                 search_query     TEXT NOT NULL,
                 cursor           TEXT,
@@ -158,6 +161,75 @@ def initialize_schemas() -> None:
                 UNIQUE (phase, tier_low, tier_high, sort_order)
             );
         """)
+
+        # Migration: ajouter les colonnes utiles à la segmentation dynamique.
+        cur.execute("ALTER TABLE github.collection_progress ADD COLUMN IF NOT EXISTS segment_key TEXT;")
+        cur.execute("ALTER TABLE github.collection_progress ADD COLUMN IF NOT EXISTS date_low DATE;")
+        cur.execute("ALTER TABLE github.collection_progress ADD COLUMN IF NOT EXISTS date_high DATE;")
+
+        # Migration: renseigner les segments historiques avec des bornes de date par défaut.
+        cur.execute("""
+            UPDATE github.collection_progress
+            SET date_low = COALESCE(date_low, DATE '2008-01-01'),
+                date_high = COALESCE(date_high, DATE '2030-01-01')
+            WHERE date_low IS NULL OR date_high IS NULL
+        """)
+
+        cur.execute("""
+            UPDATE github.collection_progress
+            SET segment_key = CONCAT(
+                'stars_',
+                tier_low,
+                '_',
+                COALESCE(tier_high::TEXT, 'inf'),
+                '__pushed_',
+                date_low::TEXT,
+                '_',
+                date_high::TEXT
+            )
+            WHERE segment_key IS NULL
+        """)
+
+        # Migration: remplacer l'unicité historique par une unicité par segment_key.
+        cur.execute("""
+            DO $$
+            BEGIN
+                IF EXISTS (
+                    SELECT 1
+                    FROM pg_constraint
+                    WHERE conname = 'collection_progress_phase_tier_low_tier_high_sort_order_key'
+                      AND conrelid = 'github.collection_progress'::regclass
+                ) THEN
+                    ALTER TABLE github.collection_progress
+                    DROP CONSTRAINT collection_progress_phase_tier_low_tier_high_sort_order_key;
+                END IF;
+            END $$;
+        """)
+
+        # Migration: supprimer les doublons historiques (notamment liés à tier_high NULL)
+        # avant de créer l'unicité par segment. On conserve la ligne la plus récente.
+        cur.execute("""
+            WITH ranked AS (
+                SELECT
+                    ctid,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY phase, segment_key, sort_order
+                        ORDER BY updated_at DESC, id DESC
+                    ) AS rn
+                FROM github.collection_progress
+            )
+            DELETE FROM github.collection_progress p
+            USING ranked r
+            WHERE p.ctid = r.ctid
+              AND r.rn > 1
+        """)
+
+        cur.execute(
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_collection_progress_segment_unique
+                ON github.collection_progress(phase, segment_key, sort_order);
+            """
+        )
         cur.execute(
             """
             CREATE INDEX IF NOT EXISTS idx_collection_progress_lookup

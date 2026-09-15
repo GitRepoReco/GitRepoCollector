@@ -152,7 +152,9 @@ class WatcherService:
             logger.info("Cycle de surveillance — premier passage (pas de cutoff).")
 
         updated_count = 0
-        search_query = f"stars:>={STAR_TIERS[0]} sort:updated-desc"
+        # Le watch doit couvrir tout le corpus collecté: seuil le plus bas -> infini.
+        watch_floor = min(STAR_TIERS)
+        search_query = f"stars:>={watch_floor} sort:updated-desc"
 
         for nodes, rate_limit in self._client.paginate(
             QUERY_SEARCH_REPOSITORIES,
