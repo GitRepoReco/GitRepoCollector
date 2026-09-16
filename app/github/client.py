@@ -14,6 +14,9 @@ logger = logging.getLogger(__name__)
 
 _TRANSIENT_STATUS_CODES = {500, 502, 503, 504}
 _MAX_RETRIES = 5
+_TRANSIENT_GRAPHQL_MESSAGES = (
+    "something went wrong while executing your query",
+)
 
 # Backoff exponentiel plafonné à 120s, conforme aux recommandations GitHub
 def _backoff(attempt: int) -> int:
@@ -42,6 +45,21 @@ def _wait_for_reset(reset_at_iso: str | None, fallback_seconds: int = 60) -> int
         wait = max(0, (reset_dt - datetime.now(timezone.utc)).total_seconds()) + 5
         return int(wait)
     return fallback_seconds
+
+
+def _is_transient_graphql_error(errors: object) -> bool:
+    """Détecte les erreurs GraphQL GitHub connues comme transitoires."""
+    if not isinstance(errors, list):
+        return False
+
+    for error in errors:
+        if not isinstance(error, dict):
+            continue
+        message = str(error.get("message", "")).lower()
+        if any(token in message for token in _TRANSIENT_GRAPHQL_MESSAGES):
+            return True
+
+    return False
 
 
 class GitHubGraphQLClient:
@@ -126,6 +144,23 @@ class GitHubGraphQLClient:
                 result = response.json()
 
                 if "errors" in result:
+                    if _is_transient_graphql_error(result.get("errors")):
+                        if attempt < _MAX_RETRIES:
+                            wait = _backoff(attempt)
+                            logger.warning(
+                                "[%s] Erreur GraphQL transitoire — retry %d/%d dans %ds",
+                                operation_name,
+                                attempt + 1,
+                                _MAX_RETRIES,
+                                wait,
+                            )
+                            time.sleep(wait)
+                            continue
+                        raise RuntimeError(
+                            f"[{operation_name}] Erreur GraphQL transitoire après "
+                            f"{_MAX_RETRIES + 1} tentatives : {result['errors']}"
+                        )
+
                     raise RuntimeError(
                         f"[{operation_name}] Erreur GraphQL : {result['errors']}"
                     )
