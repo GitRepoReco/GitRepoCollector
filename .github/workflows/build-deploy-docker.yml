@@ -50,7 +50,8 @@ jobs:
         with:
           context: .
           file: ./Dockerfile
-          push: ${{ startsWith(github.ref, 'refs/tags/') }}
+          push: ${{ github.event_name != 'pull_request' && (startsWith(github.ref, 'refs/tags/') || github.ref == 'refs/heads/master') }}
           tags: |
-            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.ref_name }}
-            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+            ${{ github.event_name == 'pull_request' &&
+                format('{0}/{1}:pr-{2}', env.REGISTRY, env.IMAGE_NAME, github.event.pull_request.number) ||
+                format('{0}/{1}:{2}', env.REGISTRY, env.IMAGE_NAME, github.ref_name) }}
