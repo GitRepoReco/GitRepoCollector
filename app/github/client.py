@@ -1,4 +1,5 @@
 import logging
+import re
 import time
 from datetime import datetime, timezone
 from typing import Generator
@@ -7,11 +8,15 @@ import requests
 import requests.models
 
 from config import GITHUB_GRAPHQL_URL, GITHUB_TOKEN, PAGE_SIZE
+from github.queries import QUERY_SEARCH_REPOSITORIES
 
 logger = logging.getLogger(__name__)
 
 _TRANSIENT_STATUS_CODES = {500, 502, 503, 504}
 _MAX_RETRIES = 5
+_TRANSIENT_GRAPHQL_MESSAGES = (
+    "something went wrong while executing your query",
+)
 
 # Backoff exponentiel plafonné à 120s, conforme aux recommandations GitHub
 def _backoff(attempt: int) -> int:
@@ -40,6 +45,21 @@ def _wait_for_reset(reset_at_iso: str | None, fallback_seconds: int = 60) -> int
         wait = max(0, (reset_dt - datetime.now(timezone.utc)).total_seconds()) + 5
         return int(wait)
     return fallback_seconds
+
+
+def _is_transient_graphql_error(errors: object) -> bool:
+    """Détecte les erreurs GraphQL GitHub connues comme transitoires."""
+    if not isinstance(errors, list):
+        return False
+
+    for error in errors:
+        if not isinstance(error, dict):
+            continue
+        message = str(error.get("message", "")).lower()
+        if any(token in message for token in _TRANSIENT_GRAPHQL_MESSAGES):
+            return True
+
+    return False
 
 
 class GitHubGraphQLClient:
@@ -124,6 +144,23 @@ class GitHubGraphQLClient:
                 result = response.json()
 
                 if "errors" in result:
+                    if _is_transient_graphql_error(result.get("errors")):
+                        if attempt < _MAX_RETRIES:
+                            wait = _backoff(attempt)
+                            logger.warning(
+                                "[%s] Erreur GraphQL transitoire — retry %d/%d dans %ds",
+                                operation_name,
+                                attempt + 1,
+                                _MAX_RETRIES,
+                                wait,
+                            )
+                            time.sleep(wait)
+                            continue
+                        raise RuntimeError(
+                            f"[{operation_name}] Erreur GraphQL transitoire après "
+                            f"{_MAX_RETRIES + 1} tentatives : {result['errors']}"
+                        )
+
                     raise RuntimeError(
                         f"[{operation_name}] Erreur GraphQL : {result['errors']}"
                     )
@@ -180,16 +217,22 @@ class GitHubGraphQLClient:
         variables: dict[str, object],
         page_info_path: list[str],
         nodes_path: list[str],
+        start_cursor: str | None = None,
+        include_page_info: bool = False,
         operation_name: str = "paginate",
-    ) -> Generator[tuple[list, dict], None, None]:
+    ) -> Generator[tuple[list, dict] | tuple[list, dict, dict], None, None]:
         """
         Itère sur toutes les pages GraphQL.
 
         page_info_path : chemin dans data["x"]["y"]["pageInfo"]
         nodes_path     : chemin dans data["x"]["y"]["nodes"]
         Yield : (nodes, rate_limit_info) pour chaque page.
+
+        Remarque importante : le cursor renvoyé par GitHub n'est valide que pour
+        la requête exacte et le tri exact utilisé pour cette page. Il ne faut pas
+        mélanger des cursors de deux ordres de tri différents.
         """
-        cursor = None
+        cursor = start_cursor
 
         while True:
             vars_with_cursor = {**variables, "after": cursor, "first": PAGE_SIZE}
@@ -206,11 +249,73 @@ class GitHubGraphQLClient:
 
             nodes = nodes_container if isinstance(nodes_container, list) else []
 
-            yield nodes, rate_limit
+            if include_page_info:
+                yield nodes, rate_limit, page_info_container
+            else:
+                yield nodes, rate_limit
 
             if not page_info_container.get("hasNextPage"):
                 break
             cursor = page_info_container["endCursor"]
+
+    @staticmethod
+    def _with_sort(search_query: str, sort_value: str) -> str:
+        """Injecte ou remplace le suffixe `sort:...` de la requête de recherche."""
+        query = search_query.strip()
+        if not query:
+            return f"sort:{sort_value}"
+        if re.search(r"\bsort:[^\s]+", query):
+            return re.sub(r"\s*sort:[^\s]+", f" sort:{sort_value}", query)
+        return f"{query} sort:{sort_value}"
+
+    def paginate_searches(
+        self,
+        search_query: str,
+        sort_orders: list[str] | tuple[str, ...],
+        variables: dict[str, object] | None = None,
+        query_template: str | None = None,
+        page_info_path: list[str] | None = None,
+        nodes_path: list[str] | None = None,
+        start_cursors: dict[str, str | None] | None = None,
+        include_page_info: bool = False,
+        operation_name: str = "SearchRepositories",
+    ) -> Generator[tuple[str, list, dict] | tuple[str, list, dict, dict], None, None]:
+        """
+        Parcourt toutes les pages pour un ensemble d'ordres de tri successifs.
+
+        Les ordres sont traités séquentiellement ; un cursor est toujours utilisé
+        avec le même tri qui l'a généré. C'est la bonne manière d'itérer tout le
+        corpus selon GitHub : on finit complètement un ordre, puis on passe au
+        suivant (ex. `created-asc` puis `updated-desc`).
+        """
+        if not sort_orders:
+            return
+
+        if query_template is None:
+            query_template = QUERY_SEARCH_REPOSITORIES
+        if page_info_path is None:
+            page_info_path = ["search", "pageInfo"]
+        if nodes_path is None:
+            nodes_path = ["search", "nodes"]
+
+        for sort_order in sort_orders:
+            ordered_query = self._with_sort(search_query, sort_order)
+            start_cursor = (start_cursors or {}).get(sort_order)
+            for page in self.paginate(
+                query_template,
+                {**(variables or {}), "query": ordered_query},
+                page_info_path,
+                nodes_path,
+                start_cursor=start_cursor,
+                include_page_info=include_page_info,
+                operation_name=f"{operation_name}_{sort_order}",
+            ):
+                if include_page_info:
+                    nodes, rate_limit, page_info = page
+                    yield sort_order, nodes, rate_limit, page_info
+                else:
+                    nodes, rate_limit = page
+                    yield sort_order, nodes, rate_limit
 
     # ----------------------------------------------------------
     # REST API : récupère le README brut

@@ -154,10 +154,6 @@ Seuls les commits **nouveaux** sont récupérés (collection incrémentale).
 | `last_seen_commit_sha` | dernier commit collecté |
 | `last_checked_at` | dernière vérification |
 
-### `github.commits`
-
-Historique des commits collectés. Contrainte `UNIQUE(repository_id, sha)` garantit l'idempotence.
-
 ### `github.repository_snapshots`
 
 Évolution des métriques dans le temps. Un snapshot est créé uniquement lorsque stars, forks, description ou language ont changé.
@@ -182,20 +178,16 @@ Le collector analyse chaque réponse GraphQL :
 -- Nombre de repositories collectés
 SELECT COUNT(*) FROM github.repositories;
 
--- Nombre de commits collectés
-SELECT COUNT(*) FROM github.commits;
-
 -- Top 10 repositories par stars
 SELECT full_name, stars, forks, language
 FROM github.repositories
 ORDER BY stars DESC
 LIMIT 10;
 
--- Commits récents
-SELECT r.full_name, c.sha, c.committed_at, c.message
-FROM github.commits c
-JOIN github.repositories r ON r.id = c.repository_id
-ORDER BY c.committed_at DESC
+-- Les 20 dépôts avec les mises à jour les plus récentes
+SELECT full_name, updated_at
+FROM  github.repositories 
+ORDER BY updated_at DESC
 LIMIT 20;
 
 -- Évolution d'un repository

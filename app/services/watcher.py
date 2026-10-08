@@ -152,7 +152,9 @@ class WatcherService:
             logger.info("Cycle de surveillance — premier passage (pas de cutoff).")
 
         updated_count = 0
-        search_query = f"stars:>={STAR_TIERS[0]} sort:updated-desc"
+        # Le watch doit couvrir tout le corpus collecté: seuil le plus bas -> infini.
+        watch_floor = min(STAR_TIERS)
+        search_query = f"stars:>={watch_floor} sort:updated-desc"
 
         for nodes, rate_limit in self._client.paginate(
             QUERY_SEARCH_REPOSITORIES,
@@ -186,7 +188,7 @@ class WatcherService:
                         continue
 
                     stored = stored_map[node["id"]]
-                    stored_updated_at = stored.get("updated_at")
+                    stored_updated_at = _ensure_utc(stored.get("updated_at"))
 
                     # Si updatedAt antérieur au cutoff : aucun repo suivant ne peut être nouveau
                     if cutoff and node_updated_at and node_updated_at <= cutoff:
@@ -295,4 +297,12 @@ class WatcherService:
 def _parse_dt(iso: str | None) -> datetime | None:
     if not iso:
         return None
-    return datetime.fromisoformat(iso.replace("Z", "+00:00"))
+    return _ensure_utc(datetime.fromisoformat(iso.replace("Z", "+00:00")))
+
+
+def _ensure_utc(dt: datetime | None) -> datetime | None:
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)

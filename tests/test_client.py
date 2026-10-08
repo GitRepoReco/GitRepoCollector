@@ -51,6 +51,29 @@ class TestExecuteGraphQL:
             with pytest.raises(RuntimeError, match="Erreur GraphQL"):
                 self.client.execute("query {}", {})
 
+    def test_erreur_graphql_transitoire_retry_puis_succes(self):
+        transient_payload = {
+            "errors": [
+                {
+                    "message": (
+                        "Something went wrong while executing your query on GitHub"
+                    )
+                }
+            ]
+        }
+        success_payload = {"data": {"rateLimit": {"remaining": 100}}}
+        headers_ok = {"x-ratelimit-remaining": "100", "x-ratelimit-reset": "9999999999"}
+        responses = [
+            _mock_response(200, transient_payload),
+            _mock_response(200, success_payload, headers=headers_ok),
+        ]
+        with patch("requests.post", side_effect=responses):
+            with patch("time.sleep") as mock_sleep:
+                data, _ = self.client.execute("query {}", {})
+
+        assert data is not None
+        mock_sleep.assert_called_once()
+
     def test_http_502_retry_puis_succes(self):
         success_payload = {"data": {"rateLimit": {"remaining": 100}}}
         headers_ok = {"x-ratelimit-remaining": "100", "x-ratelimit-reset": "9999999999"}

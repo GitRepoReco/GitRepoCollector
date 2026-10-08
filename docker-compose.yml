@@ -4,10 +4,13 @@ services:
     container_name: github_postgres
     restart: unless-stopped
 
+    env_file:
+      - .env
+
     environment:
-      POSTGRES_DB: github_data
-      POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: ${POSTGRES_DB:-github_data}
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
 
     ports:
       - "5432:5432"
@@ -16,7 +19,7 @@ services:
       - postgres_data:/var/lib/postgresql/data
 
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres} -d ${POSTGRES_DB:-github_data}"]
       interval: 5s
       timeout: 5s
       retries: 10
@@ -35,9 +38,18 @@ services:
 
     environment:
       POSTGRES_HOST: postgres
+      POSTGRES_DB: ${POSTGRES_DB:-github_data}
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
       POSTGRES_PORT: 5432
+
+      STAR_TIERS: 100000,75000,50000,30000,20000,10000,5000,1000,500,100
+
+      GITHUB_TOKEN: ${GITHUB_TOKEN}
+
       MAX_REPOSITORIES: 0
       POLL_INTERVAL_SECONDS: 300
+      PAGE_SIZE: 25
       LOG_LEVEL: INFO
 
 volumes:
