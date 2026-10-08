@@ -16,7 +16,7 @@ Docker container
   ├── config.py            — variables d'environnement
   ├── database/
   │   ├── connection.py    — connexion PostgreSQL
-  │   └── schema.py        — création des schemas/tables
+  │   └── schema.py        — bootstrap DDL + fallback validation
   ├── github/
   │   ├── client.py        — client GraphQL (retry, rate limit)
   │   ├── queries.py       — requêtes GraphQL centralisées
@@ -84,9 +84,10 @@ docker compose up --build
 
 Le système va alors :
 1. Démarrer PostgreSQL
-2. Créer les schemas et tables
-3. Démarrer la collecte historique
-4. Passer automatiquement en mode surveillance
+2. Vérifier d'abord que la base est prête (schemas/tables + droits runtime collector)
+3. Si la vérification échoue, tenter le bootstrap des schemas/tables (DDL), puis revalider
+4. Démarrer la collecte historique
+5. Passer automatiquement en mode surveillance
 
 Pour lancer en arrière-plan :
 

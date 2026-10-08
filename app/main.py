@@ -32,7 +32,7 @@ def main() -> None:
 
     logger.info("=== GitHub GraphQL Collector démarré ===")
 
-    logger.info("Initialisation des schemas PostgreSQL...")
+    logger.info("Initialisation/validation des schemas PostgreSQL...")
     initialize_schemas()
 
     logger.info("Démarrage de la collecte historique...")
