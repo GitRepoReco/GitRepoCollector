@@ -55,6 +55,4 @@ jobs:
           file: ./Dockerfile
           push: ${{ github.event_name != 'pull_request' && startsWith(github.ref, 'refs/tags/') }}
           tags: |
-            ${{ github.event_name == 'pull_request' &&
-                format('{0}/{1}:pr-{2}', env.REGISTRY, env.IMAGE_NAME, github.event.pull_request.number) ||
-                format('{0}/{1}:{2}', env.REGISTRY, env.IMAGE_NAME, github.ref_name) }}
+            ${{ steps.meta.outputs.tags }}
