@@ -133,7 +133,7 @@ attendre POLL_INTERVAL_SECONDS
 pour chaque repository connu
         ↓
 dernier commit GitHub == last_seen_commit_sha ?
-   non → récupérer commits manquants → insérer → snapshot
+   non → snapshot de l'ancien état → récupérer commits manquants → update repositories
    oui → pas d'action
 ```
 
@@ -157,7 +157,7 @@ Seuls les commits **nouveaux** sont récupérés (collection incrémentale).
 
 ### `github.repository_snapshots`
 
-Évolution des métriques dans le temps. Un snapshot est créé uniquement lorsque stars, forks, description ou language ont changé.
+Historique des états précédents. Lorsqu'un repository change, le watcher enregistre d'abord l'ancien état dans cette table, puis met à jour `github.repositories` avec l'état courant.
 
 ### `monitoring.rate_limit_usage`
 

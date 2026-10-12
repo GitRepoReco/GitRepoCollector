@@ -54,7 +54,8 @@ def _get_stored_repos_by_ids(conn: DBConn, ids: list[str]) -> dict[str, dict]:
             """
             SELECT id, full_name, default_branch, last_seen_commit_sha,
                    updated_at, stars, forks, description, language, is_archived,
-                   total_watchers, total_issues_open, total_prs_open,
+                   total_watchers, total_issues_open, total_issues_closed,
+                   total_prs_open, total_prs_merged,
                    total_releases, homepage_url, disk_usage_kb, topics
             FROM github.repositories
             WHERE id = ANY(%s)
@@ -260,35 +261,15 @@ class WatcherService:
     # ----------------------------------------------------------
 
     def _process_changed_repo(self, conn: DBConn, node: dict, stored: dict) -> None:
+        # Conserver l'état précédent avant de mettre à jour repositories.
+        _insert_snapshot(conn, node["id"], stored.get("last_seen_commit_sha"), stored)
+
         repo = _parse_repo(node)
         _upsert_repositories(conn, [repo])
 
         commit_sha = collect_readme_for_repo(conn, repo, self._client, self._monitor)
         if commit_sha:
             _update_repo_commit_state(conn, repo["id"], commit_sha)
-
-        # Snapshot avec toutes les métriques courantes
-        cur = conn.cursor()
-        try:
-            cur.execute(
-                """
-                SELECT stars, forks, total_watchers, total_issues_open, total_issues_closed,
-                       total_prs_open, total_prs_merged, total_releases,
-                       description, language, topics, is_archived, homepage_url, disk_usage_kb
-                FROM github.repositories WHERE id = %s
-                """,
-                (repo["id"],),
-            )
-            row = cur.fetchone()
-        finally:
-            cur.close()
-
-        if row:
-            cols = ["stars", "forks", "total_watchers", "total_issues_open", "total_issues_closed",
-                    "total_prs_open", "total_prs_merged", "total_releases",
-                    "description", "language", "topics", "is_archived", "homepage_url", "disk_usage_kb"]
-            state = dict(zip(cols, row))
-            _insert_snapshot(conn, repo["id"], commit_sha, state)
 
 # ============================================================
 # Utilitaire
